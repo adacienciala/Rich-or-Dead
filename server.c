@@ -1,4 +1,4 @@
-#define _GNU_SOURCE
+#define _GNU_SOURCE //pthread_tryjoin_np
 #include <stdio.h>
 #include <unistd.h>
 #include <pthread.h>
@@ -38,6 +38,7 @@ int max_x, max_y;
 #define SIGHT 5
 enum type_t { HUMAN, CPU };
 enum directions_t { STAY, NORTH, EAST, SOUTH, WEST };
+enum state_t { BE_EMPTY, CONTINUE, JOIN, EXIT };
 
 struct coords_t
 {
@@ -61,37 +62,57 @@ struct player_data_t
     int deaths;
     int coins_carried;
     int coins_brought;
+
+    // used only in players' shms
     char player_minimap[SIGHT][SIGHT];
     char player_board[ROWS][COLUMNS];
+    sem_t player_moved;
+    sem_t player_continue;
+};
+
+struct queue_t
+{
+    enum state_t want_to;
+    enum type_t type;
+    int PID;
+};
+
+struct lobby_t
+{
+    struct queue_t queue[MAX_PLAYERS];
+
+    sem_t ask;
+    sem_t leave;
+
+    sem_t joined;
+    sem_t exited;
 };
 
 struct game_data_t
 {
+    struct lobby_t* lobby;
+
     int PID;
     int round_counter;
     struct coords_t campsite;
 
     int players_counter;
-    struct player_data_t* players[MAX_PLAYERS];
+    struct player_data_t* players_shared[MAX_PLAYERS];
+    struct player_data_t players[MAX_PLAYERS];
 
     int beasts_counter;
     struct coords_t beasts[MAX_BEASTS];
 
     int chests_counter;
     struct dropped_chests_t chests[MAX_CHESTS];
-
 } game_data;
-
-// semaphores
-// 4 semafory z danymi do druku
-
-
-
 
 int load_board(char *filename);
 void set_up_game(int PID);
 void* print_board(void* none);
-void* key_events(void *none);
+void* key_events(void* none);
+void* player_in(void* none);
+void* player_out(void* none);
 
 int main(void)
 {
@@ -114,8 +135,22 @@ int main(void)
 
 void set_up_game(int PID)
 {
+    // zero and NULL everything
     memset(&game_data, 0, sizeof(struct game_data_t));
+
+    // set the lobby, PID and coords
+    int fd = shm_open("lobby", O_CREAT | O_RDWR, 0600);
+    ftruncate(fd, sizeof(struct lobby_t));
+    game_data.lobby = mmap(NULL, sizeof(struct queue_t), PROT_WRITE | PROT_READ, MAP_SHARED, fd, 0);
+
+    memset(game_data.lobby->queue, 0, sizeof(struct queue_t) * MAX_PLAYERS);
+    sem_init(&game_data.lobby->ask, 1, 1);
+    sem_init(&game_data.lobby->leave, 1, 0);
+    sem_init(&game_data.lobby->joined, 1, 0);
+    sem_init(&game_data.lobby->exited, 1, 0);
+
     game_data.PID = PID;
+
     while(1)
     {
         game_data.campsite.x = rand() % COLUMNS;
@@ -135,7 +170,6 @@ void set_up_game(int PID)
     {
         game_data.chests[i].coords.x = -2;
         game_data.chests[i].coords.y = -2;
-        game_data.chests[i].amount = 0;
     }
 }
 
@@ -326,5 +360,116 @@ void* key_events(void *none)
                 }
                 break;
         }
+    }
+}
+
+#define PLAYER_PID(pid) "player_"#pid
+
+void* player_in(void* none)
+{
+    while (1)
+    {
+        // waiting for someone to ask to join the game
+        sem_wait(&game_data.lobby->joined);
+
+        if (game_data.players_counter < MAX_PLAYERS)
+        {
+            for (int id = 0; id < MAX_PLAYERS; ++id)
+            {
+                // looking for the joined player
+                if (game_data.lobby->queue[id].want_to == JOIN)
+                {
+                    // making a personalized shared memory with their PID
+                    int fd = shm_open(PLAYER_PID(game_data.lobby->queue[id].PID), O_CREAT | O_RDWR, 0600);
+                    ftruncate(fd, sizeof(struct player_data_t));
+                    game_data.players_shared[id] = mmap(NULL, sizeof(struct player_data_t), PROT_WRITE | PROT_READ, MAP_SHARED, fd, 0);
+
+                    // setting up server's respecting struct
+                    memset(&game_data.players[id], 0, sizeof(struct player_data_t));
+                    game_data.players[id].PID = game_data.lobby->queue[id].PID;
+                    game_data.players[id].type = game_data.lobby->queue[id].type;
+                    int x = -1, y = -1;
+                    while (1)
+                    {
+                        x = rand() % COLUMNS;
+                        y = rand() % ROWS;
+                        if (FREE_SPACE(board[y][x])) break;
+                    }
+                    game_data.players[id].coords.x = x;
+                    game_data.players[id].coords.y = y;
+
+                    // setting up player's struct
+                    memset(&game_data.players_shared[id], 0, sizeof(struct player_data_t));
+                    game_data.players_shared[id]->PID = game_data.players[id].PID;
+                    game_data.players_shared[id]->type = game_data.players[id].type;
+                    game_data.players_shared[id]->coords.x = x;
+                    game_data.players_shared[id]->coords.y = y;
+                    int local_x = (x - 2) < 0 ? 0 : (x - 2);
+                    int local_y = (y - 2) < 0 ? 0 : (y - 2);
+                    for (int i = local_y; i <= (y + 2) && i < ROWS; ++i)
+                    {
+                        for (int j = local_x; j <= (x + 2) && j < COLUMNS; ++j)
+                        {
+                            game_data.players_shared[id]->player_minimap[i][j] = board[i][j];
+                        }
+                    }
+                    for (int i = 0; i < SIGHT; ++i)
+                    {
+                        for (int j = 0; j < SIGHT; ++j)
+                        {
+                            if ((y - 2 + i) < 0 || (x - 2 + j) < 0 || (y - 2 + i) >= ROWS || (x - 2 + j) >= COLUMNS) game_data.players_shared[id]->player_minimap[i][j] = ' ';
+                            else game_data.players_shared[id]->player_minimap[i][j] = board[y - 2 + i][x - 2 + j];
+                        }
+                    }
+                    // naloz wrogow jakos? XD bestie i playerow
+
+                    sem_init(&game_data.players_shared[id]->player_moved, 1, 0);
+                    sem_init(&game_data.players_shared[id]->player_continue, 1, 1);
+
+                    // setting up lobby info and allowing the player to leave the lobby and start playing
+                    game_data.lobby->queue[id].want_to = CONTINUE;
+                    sem_post(&game_data.lobby->leave);
+                    sem_post(&game_data.lobby->ask);
+                    break;
+                }
+            }
+        }
+    }
+}
+
+void* player_out(void* none)
+{
+    while (1)
+    {
+        // waiting for someone to ask to exit the game
+        sem_wait(&game_data.lobby->exited);
+
+        if (game_data.players_counter < MAX_PLAYERS)
+        {
+            for (int id = 0; id < MAX_PLAYERS; ++id)
+            {
+                // looking for the exiting player
+                if (game_data.lobby->queue[id].want_to == EXIT)
+                {
+                    // cleaning up semaphores and player's shm
+                    sem_destroy(&game_data.players_shared[id]->player_moved);
+                    sem_destroy(&game_data.players_shared[id]->player_continue);
+                    int pid = game_data.players_shared[id]->PID;
+                    munmap(game_data.players_shared[id], sizeof(struct player_data_t));
+                    shm_unlink(PLAYER_PID(pid));
+
+                    // reseting server's struct
+                    memset(&game_data.players[id], 0, sizeof(struct player_data_t));
+
+                    // setting up lobby info and allowing the player to leave the lobby and exit
+                    game_data.lobby->queue[id].want_to = BE_EMPTY;
+                    sem_post(&game_data.lobby->leave);
+                    sem_post(&game_data.lobby->ask);
+                    break;
+                }
+            }
+
+        }
+
     }
 }
