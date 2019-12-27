@@ -1,4 +1,4 @@
-#define _GNU_SOURCE //pthread_tryjoin_np
+#define _GNU_SOURCE // pthread_tryjoin_np
 #include <stdio.h>
 #include <unistd.h>
 #include <pthread.h>
@@ -8,6 +8,7 @@
 #include <ncurses.h>
 #include <semaphore.h>
 #include <fcntl.h>
+#include <signal.h> // kill(2)
 #include <sys/mman.h>
 #include <sys/types.h>
 
@@ -31,11 +32,12 @@
 char board[ROWS][COLUMNS];
 int max_x, max_y;
 
+
 // game stuff
 #define MAX_PLAYERS 4
 #define MAX_BEASTS 25
-#define MAX_CHESTS 100
 #define SIGHT 5
+
 enum type_t { HUMAN, CPU };
 enum directions_t { STAY, NORTH, EAST, SOUTH, WEST };
 enum state_t { BE_EMPTY, CONTINUE, JOIN, EXIT };
@@ -46,17 +48,22 @@ struct coords_t
     int y;
 };
 
-struct dropped_chests_t
+struct beast_t
 {
+    pthread_t beast_thread;
+    sem_t go;
     struct coords_t coords;
-    int amount;
 };
 
 struct player_data_t
 {
+    int ID;
     int PID;
+    int server_PID;
     enum type_t type;
     struct coords_t coords;
+    struct coords_t campsite;
+    int round_counter;
     enum directions_t direction;
     int slowed_down;
     int deaths;
@@ -101,10 +108,9 @@ struct game_data_t
     struct player_data_t players[MAX_PLAYERS];
 
     int beasts_counter;
-    struct coords_t beasts[MAX_BEASTS];
+    struct beast_t beasts[MAX_BEASTS];
 
-    int chests_counter;
-    struct dropped_chests_t chests[MAX_CHESTS];
+    int chests[ROWS][COLUMNS];
 } game_data;
 
 int load_board(char *filename);
@@ -113,6 +119,19 @@ void* print_board(void* none);
 void* key_events(void* none);
 void* player_in(void* none);
 void* player_out(void* none);
+void* rounds_up(void* none);
+void* beast_action(void* id);
+int player_pid_shm(char* action, int pid);
+
+
+// server's stuff
+sem_t game_end;
+
+// DEVELOPMENT QUESTIONS
+// chyba niepotrzebne mi players_counter tak po prawdzie
+// - bestie, boty + algorytmy do nich (bestia -> post po rundzie)
+// - pieprzone mutexy bo dyskoteka od refreshow ;-;
+// - ograniczenie spawnowania -> free_space w strukturze?
 
 int main(void)
 {
@@ -126,31 +145,73 @@ int main(void)
     load_board("board.txt");
     set_up_game((int)getpid());
 
-    pthread_t printing_thread;
-    pthread_create(&printing_thread, NULL, print_board, NULL);
+    pthread_t print_board_thread, player_in_thread, player_out_thread, key_events_thread;
 
-    usleep(1000000*MS);
+    pthread_create(&print_board_thread, NULL, print_board, NULL);
+    pthread_create(&player_in_thread, NULL, player_in, NULL);
+    pthread_create(&player_out_thread, NULL, player_out, NULL);
+    pthread_create(&key_events_thread, NULL, key_events, NULL);
+
+    sem_init(&game_end, 0, 0);
+    sem_wait(&game_end);
+
+    // clean up lobby's semaphores, lobby's shm and game's semaphore
+    sem_destroy(&game_data.lobby->ask);
+    sem_destroy(&game_data.lobby->leave);
+    sem_destroy(&game_data.lobby->joined);
+    sem_destroy(&game_data.lobby->exited);
+
+    munmap(game_data.lobby, sizeof(struct lobby_t));
+    shm_unlink("lobby");
+
+    sem_destroy(&game_end);
+
+    endwin();
     return 0;
+}
+
+int player_pid_shm(char* action, int pid)
+{
+    char name[20];
+    sprintf(name, "player_%d", pid);
+    if (strcmp(action, "open") == 0)
+    {
+        return shm_open(name, O_CREAT | O_RDWR, 0600);
+    }
+    else if (strcmp(action, "unlink") == 0)
+    {
+        return shm_unlink(name);
+    }
+    else return -1;
 }
 
 void set_up_game(int PID)
 {
-    // zero and NULL everything
-    memset(&game_data, 0, sizeof(struct game_data_t));
+    // zero every counter
+    game_data.round_counter = 0;
+    game_data.players_counter = 0;
+    game_data.beasts_counter = 0;
 
-    // set the lobby, PID and coords
+    // set the lobby, PID, coords and stuff
     int fd = shm_open("lobby", O_CREAT | O_RDWR, 0600);
     ftruncate(fd, sizeof(struct lobby_t));
     game_data.lobby = mmap(NULL, sizeof(struct queue_t), PROT_WRITE | PROT_READ, MAP_SHARED, fd, 0);
 
-    memset(game_data.lobby->queue, 0, sizeof(struct queue_t) * MAX_PLAYERS);
+    for (int i = 0; i < MAX_PLAYERS; ++i)
+    {
+        game_data.players_shared[i] = NULL;
+
+        game_data.lobby->queue[i].want_to = BE_EMPTY;
+        game_data.lobby->queue[i].type = CPU;
+        game_data.lobby->queue[i].PID = -1;
+    }
+
     sem_init(&game_data.lobby->ask, 1, 1);
     sem_init(&game_data.lobby->leave, 1, 0);
     sem_init(&game_data.lobby->joined, 1, 0);
     sem_init(&game_data.lobby->exited, 1, 0);
 
     game_data.PID = PID;
-
     while(1)
     {
         game_data.campsite.x = rand() % COLUMNS;
@@ -163,13 +224,15 @@ void set_up_game(int PID)
     }
     for (int i = 0; i < MAX_BEASTS; ++i)
     {
-        game_data.beasts[i].x = -2;
-        game_data.beasts[i].y = -2;
+        game_data.beasts[i].coords.x = -2;
+        game_data.beasts[i].coords.y = -2;
     }
-    for (int i = 0; i < MAX_CHESTS; ++i)
+    for (int i = 0; i < ROWS; ++i)
     {
-        game_data.chests[i].coords.x = -2;
-        game_data.chests[i].coords.y = -2;
+        for (int j = 0; j < COLUMNS; ++j)
+        {
+            game_data.chests[i][j] = 0;
+        }
     }
 }
 
@@ -207,25 +270,26 @@ void* print_board(void* none)
     init_pair(C_DROPPED, COLOR_GREEN, COLOR_YELLOW);
     init_pair(C_DEFAULT, COLOR_BLACK, COLOR_WHITE);
 
-    // terminal background
-    attron(COLOR_PAIR(C_DEFAULT));
-    for (int i = 0; i < max_y; ++i)
-    {
-        for (int j = 0; j < max_x; ++j)
-        {
-            mvprintw(i, j, " ");
-        }
-    }
+    pthread_t rounds_up_thread;
 
     while(1)
     {
+        clear();
+        // terminal background
+        attron(COLOR_PAIR(C_DEFAULT));
+        for (int i = 0; i < max_y; ++i)
+        {
+            for (int j = 0; j < max_x; ++j)
+            {
+                mvprintw(i, j, " ");
+            }
+        }
+
         // board
         for (int i = 0; i < ROWS; ++i)
         {
             for (int j = 0; j < COLUMNS; ++j)
             {
-                // players and beasts
-
                 // the board and artefacts
                 switch (board[i][j])
                 {
@@ -252,40 +316,61 @@ void* print_board(void* none)
             }
         }
 
+        // players
+        attron(COLOR_PAIR(C_PLAYER));
+        for (int id = 0; id < MAX_PLAYERS; ++id)
+        {
+            if (game_data.players_shared[id] != NULL)
+            {
+                mvprintw(game_data.players[id].coords.y, game_data.players[id].coords.x, "%d", id+1);
+            }
+        }
+
+        // beasts
+        attron(COLOR_PAIR(C_BEAST));
+        for (int id_beast = 0; id_beast < MAX_BEASTS; ++id_beast)
+        {
+            if (game_data.beasts[id_beast].coords.x >= 0)
+            {
+                mvprintw(game_data.beasts[id_beast].coords.y, game_data.beasts[id_beast].coords.x, "*");
+            }
+        }
+
         // server info
         int cur_row = 0, cur_col = COLUMNS + 4;
         attron(COLOR_PAIR(C_DEFAULT));
-        mvprintw(++cur_row, cur_col, "Server's PID: %d", -1);
-        mvprintw(++cur_row, cur_col + 1, "Campsite X/Y: %d/%d", -1, -1);
-        mvprintw(++cur_row, cur_col + 1, "Round number: %d", -1);
+        mvprintw(++cur_row, cur_col, "Server's PID: %d", game_data.PID);
+        mvprintw(++cur_row, cur_col + 1, "Campsite X/Y: %02d/%02d", game_data.campsite.x, game_data.campsite.y);
+        mvprintw(++cur_row, cur_col + 1, "Round number: %d", game_data.round_counter);
 
         // players info
         ++cur_row;
         for (int id = 0; id < MAX_PLAYERS; ++id)
         {
             int player_connected = 0;
-            // if polaczony zmieniaj zmienna
+            if (game_data.players_shared[id] != NULL) player_connected = 1;
+
             mvprintw(++cur_row, cur_col, "Parameter:");
             mvprintw(cur_row, cur_col + 13 + (id * 10), "Player%d", id + 1);
             mvprintw(++cur_row, cur_col + 1, "PID");
-            if (player_connected) mvprintw(cur_row, cur_col + 13 + (id * 10), "%d", -1);
-            else mvprintw(cur_row, cur_col + 13 + (id * 10), "%c", '-');
+            if (player_connected) mvprintw(cur_row, cur_col + 13 + (id * 10), "%d    ", game_data.players_shared[id]->PID);
+            else mvprintw(cur_row, cur_col + 13 + (id * 10), "%c    ", '-');
             mvprintw(++cur_row, cur_col + 1, "Type");
-            if (player_connected) mvprintw(cur_row, cur_col + 13 + (id * 10), "%s", "NONE");
-            else mvprintw(cur_row, cur_col + 13 + (id * 10), "%c", '-');
+            if (player_connected) mvprintw(cur_row, cur_col + 13 + (id * 10), "%s    ", (game_data.players_shared[id]->type == CPU) ? "CPU": "HUMAN");
+            else mvprintw(cur_row, cur_col + 13 + (id * 10), "%c    ", '-');
             mvprintw(++cur_row, cur_col + 1, "Curr X/Y");
-            if (player_connected) mvprintw(cur_row, cur_col + 13 + (id * 10), "%d/%d", -1, -1);
+            if (player_connected) mvprintw(cur_row, cur_col + 13 + (id * 10), "%02d/%02d", game_data.players_shared[id]->coords.x, game_data.players_shared[id]->coords.y);
             else mvprintw(cur_row, cur_col + 13 + (id * 10), "%s", "--/--");
             mvprintw(++cur_row, cur_col + 1, "Deaths");
-            if (player_connected) mvprintw(cur_row, cur_col + 13 + (id * 10), "%d", -1);
-            else mvprintw(cur_row, cur_col + 13 + (id * 10), "%c", '-');
+            if (player_connected) mvprintw(cur_row, cur_col + 13 + (id * 10), "%d    ", game_data.players_shared[id]->deaths);
+            else mvprintw(cur_row, cur_col + 13 + (id * 10), "%c    ", '-');
             mvprintw(++cur_row, cur_col + 1, "Coins");
             mvprintw(++cur_row, cur_col + 2, "carried");
-            if (player_connected) mvprintw(cur_row, cur_col + 13 + (id * 10), "%d", -1);
-            else mvprintw(cur_row, cur_col + 13 + (id * 10), "%c", '-');
+            if (player_connected) mvprintw(cur_row, cur_col + 13 + (id * 10), "%d    ", game_data.players_shared[id]->coins_carried);
+            else mvprintw(cur_row, cur_col + 13 + (id * 10), "%c    ", '-');
             mvprintw(++cur_row, cur_col + 2, "brought");
-            if (player_connected) mvprintw(cur_row, cur_col + 13 + (id * 10), "%d", -1);
-            else mvprintw(cur_row, cur_col + 13 + (id * 10), "%c", '-');
+            if (player_connected) mvprintw(cur_row, cur_col + 13 + (id * 10), "%d    ", game_data.players_shared[id]->coins_brought);
+            else mvprintw(cur_row, cur_col + 13 + (id * 10), "%c    ", '-');
             cur_row -= 8;
         }
 
@@ -321,7 +406,10 @@ void* print_board(void* none)
         mvprintw(++cur_row, cur_col + 7, "- dropped treasure");
 
         refresh();
-        usleep(500 * MS);
+        game_data.round_counter++;
+        pthread_create(&rounds_up_thread, NULL, rounds_up, NULL);
+        usleep(125 * MS);
+        pthread_join(rounds_up_thread, NULL);
     }
 }
 
@@ -337,12 +425,18 @@ void* key_events(void *none)
             // quit the game
             case 'q':
             case 'Q':
-                //postnij semafor zamykajacy gre
+                sem_post(&game_end);
                 return NULL;
             // add a new beast
             case 'b':
             case 'B':
-                //watek dodania bestii
+                for (int i = 0; i < MAX_BEASTS; ++i)
+                {
+                    if (game_data.beasts[i].coords.x < 0)
+                    {
+                        pthread_create(&game_data.beasts[i].beast_thread, NULL, beast_action, i);
+                    }
+                }
                 break;
             // add a coin/treasure/large treasure
             case 'c':
@@ -363,8 +457,6 @@ void* key_events(void *none)
     }
 }
 
-#define PLAYER_PID(pid) "player_"#pid
-
 void* player_in(void* none)
 {
     while (1)
@@ -380,14 +472,16 @@ void* player_in(void* none)
                 if (game_data.lobby->queue[id].want_to == JOIN)
                 {
                     // making a personalized shared memory with their PID
-                    int fd = shm_open(PLAYER_PID(game_data.lobby->queue[id].PID), O_CREAT | O_RDWR, 0600);
+                    int fd = player_pid_shm("open", game_data.lobby->queue[id].PID);
                     ftruncate(fd, sizeof(struct player_data_t));
                     game_data.players_shared[id] = mmap(NULL, sizeof(struct player_data_t), PROT_WRITE | PROT_READ, MAP_SHARED, fd, 0);
 
                     // setting up server's respecting struct
-                    memset(&game_data.players[id], 0, sizeof(struct player_data_t));
+                    game_data.players[id].ID = id+1;
                     game_data.players[id].PID = game_data.lobby->queue[id].PID;
+                    game_data.players[id].server_PID = game_data.PID;
                     game_data.players[id].type = game_data.lobby->queue[id].type;
+
                     int x = -1, y = -1;
                     while (1)
                     {
@@ -398,19 +492,43 @@ void* player_in(void* none)
                     game_data.players[id].coords.x = x;
                     game_data.players[id].coords.y = y;
 
-                    // setting up player's struct
-                    memset(&game_data.players_shared[id], 0, sizeof(struct player_data_t));
+                    game_data.players[id].campsite.x = -4;
+                    game_data.players[id].campsite.y = -4;
+
+                    game_data.players[id].round_counter = game_data.round_counter;
+                    game_data.players[id].direction = STAY;
+                    game_data.players[id].slowed_down = 0;
+                    game_data.players[id].deaths = 0;
+                    game_data.players[id].coins_carried = 0;
+                    game_data.players[id].coins_brought = 0;
+
+                    // setting up player's struct and (mini)maps
+                    game_data.players_shared[id]->ID = game_data.players[id].ID;
                     game_data.players_shared[id]->PID = game_data.players[id].PID;
+                    game_data.players_shared[id]->server_PID = game_data.players[id].server_PID;
                     game_data.players_shared[id]->type = game_data.players[id].type;
                     game_data.players_shared[id]->coords.x = x;
                     game_data.players_shared[id]->coords.y = y;
+                    game_data.players_shared[id]->round_counter = game_data.players[id].round_counter;
+                    game_data.players_shared[id]->direction = STAY;
+                    game_data.players_shared[id]->slowed_down = 0;
+                    game_data.players_shared[id]->deaths = 0;
+                    game_data.players_shared[id]->coins_carried = 0;
+                    game_data.players_shared[id]->coins_brought = 0;
+
                     int local_x = (x - 2) < 0 ? 0 : (x - 2);
                     int local_y = (y - 2) < 0 ? 0 : (y - 2);
                     for (int i = local_y; i <= (y + 2) && i < ROWS; ++i)
                     {
                         for (int j = local_x; j <= (x + 2) && j < COLUMNS; ++j)
                         {
-                            game_data.players_shared[id]->player_minimap[i][j] = board[i][j];
+                            game_data.players_shared[id]->player_board[i][j] = board[i][j];
+
+                            if (board[i][j] == 'A')
+                            {
+                                game_data.players[id].campsite.x = j;
+                                game_data.players[id].campsite.y = i;
+                            }
                         }
                     }
                     for (int i = 0; i < SIGHT; ++i)
@@ -421,7 +539,8 @@ void* player_in(void* none)
                             else game_data.players_shared[id]->player_minimap[i][j] = board[y - 2 + i][x - 2 + j];
                         }
                     }
-                    // naloz wrogow jakos? XD bestie i playerow
+                    game_data.players_shared[id]->campsite.x = game_data.players[id].campsite.x;
+                    game_data.players_shared[id]->campsite.y = game_data.players[id].campsite.y;
 
                     sem_init(&game_data.players_shared[id]->player_moved, 1, 0);
                     sem_init(&game_data.players_shared[id]->player_continue, 1, 1);
@@ -456,10 +575,11 @@ void* player_out(void* none)
                     sem_destroy(&game_data.players_shared[id]->player_continue);
                     int pid = game_data.players_shared[id]->PID;
                     munmap(game_data.players_shared[id], sizeof(struct player_data_t));
-                    shm_unlink(PLAYER_PID(pid));
+                    game_data.players_shared[id] = NULL;
+                    player_pid_shm("unlink", pid);
 
-                    // reseting server's struct
-                    memset(&game_data.players[id], 0, sizeof(struct player_data_t));
+                    // reseting a bit server's struct
+                    game_data.players[id].PID = -1;
 
                     // setting up lobby info and allowing the player to leave the lobby and exit
                     game_data.lobby->queue[id].want_to = BE_EMPTY;
@@ -468,8 +588,266 @@ void* player_out(void* none)
                     break;
                 }
             }
-
         }
+    }
+}
 
+void* rounds_up(void* none)
+{
+    // check whether any player rage quitted
+    for (int id = 0; id < MAX_PLAYERS; ++id)
+    {
+        if (game_data.players_shared[id] != NULL)
+        {
+            int pid = game_data.players_shared[id]->PID;
+            // that looser quitted, clean up after them
+            if (kill(pid, 0) != 0)
+            {
+                // cleaning up semaphores and player's shm
+                sem_destroy(&game_data.players_shared[id]->player_moved);
+                sem_destroy(&game_data.players_shared[id]->player_continue);
+                munmap(game_data.players_shared[id], sizeof(struct player_data_t));
+                game_data.players_shared[id] = NULL;
+                player_pid_shm("unlink", pid);
+
+                // reseting a bit server's struct
+                game_data.players[id].PID = -1;
+
+                // setting up lobby info and allowing the player to leave the lobby and exit
+                game_data.lobby->queue[id].want_to = BE_EMPTY;
+            }
+        }
+    }
+
+    int moved[MAX_PLAYERS] = {0};
+    // check every connected player's decision
+    for (int id = 0; id < MAX_PLAYERS; ++id)
+    {
+        if (game_data.players_shared[id] != NULL)
+        {
+            // player has moved!
+            if (sem_trywait(&game_data.players_shared[id]->player_moved) == 0)
+            {
+                moved[id] = 1;
+                int new_x = game_data.players[id].coords.x;
+                int new_y = game_data.players[id].coords.y;
+                if (game_data.players[id].slowed_down == 0)
+                {
+                    switch (game_data.players_shared[id]->direction)
+                    {
+                        case NORTH:
+                            new_y -= 1;
+                            if (new_y < 0 || board[new_y][new_x] == '|') new_y += 1;
+                            break;
+                        case EAST:
+                            new_x += 1;
+                            if (new_x >= COLUMNS || board[new_y][new_x] == '|') new_x -= 1;
+                            break;
+                        case SOUTH:
+                            new_y += 1;
+                            if (new_y >= ROWS || board[new_y][new_x] == '|') new_y -= 1;
+                            break;
+                        case WEST:
+                            new_x -= 1;
+                            if (new_x < 0 || board[new_y][new_x] == '|') new_x += 1;
+                    }
+                }
+                game_data.players[id].coords.x = new_x;
+                game_data.players[id].coords.y = new_y;
+            }
+
+            // coins and bush stuff
+            if (moved[id])
+            {
+                switch(board[game_data.players[id].coords.y][game_data.players[id].coords.x])
+                {
+                    case 'c':
+                        game_data.players[id].coins_carried += 1;
+                        board[game_data.players[id].coords.y][game_data.players[id].coords.x] = ' ';
+                        break;
+                    case 't':
+                        game_data.players[id].coins_carried += 10;
+                        board[game_data.players[id].coords.y][game_data.players[id].coords.x] = ' ';
+                        break;
+                    case 'T':
+                        game_data.players[id].coins_carried += 50;
+                        board[game_data.players[id].coords.y][game_data.players[id].coords.x] = ' ';
+                        break;
+                    case 'D':
+                        game_data.players[id].coins_carried += game_data.chests[game_data.players[id].coords.y][game_data.players[id].coords.x];
+                        board[game_data.players[id].coords.y][game_data.players[id].coords.x] = ' ';
+                        game_data.chests[game_data.players[id].coords.y][game_data.players[id].coords.x] = 0;
+                        break;
+                    case 'A':
+                        game_data.players[id].coins_brought += game_data.players[id].coins_carried;
+                        game_data.players[id].coins_carried = 0;
+                        break;
+                    case '#':
+                        game_data.players[id].slowed_down = !game_data.players[id].slowed_down;
+                        break;
+                }
+            }
+            game_data.players[id].direction = STAY;
+            game_data.players[id].round_counter = game_data.round_counter;
+        }
+    }
+
+    // another player
+    // looking for collisions
+    int dead[MAX_PLAYERS] = {0};
+    for (int id = 0; id < MAX_PLAYERS; ++id)
+    {
+        for (int id_enemy = 0; id_enemy < MAX_PLAYERS; ++id_enemy)
+        {
+            if (game_data.players_shared[id] != NULL && game_data.players_shared[id_enemy] != NULL && id_enemy != id)
+            {
+                if ((game_data.players[id_enemy].coords.x == game_data.players[id].coords.x) && (game_data.players[id_enemy].coords.y == game_data.players[id].coords.y))
+                {
+                    dead[id] = 1;
+                    board[game_data.players[id].coords.y][game_data.players[id].coords.x] = 'D';
+                    game_data.chests[game_data.players[id].coords.y][game_data.players[id].coords.x] += game_data.players[id].coins_carried;
+                }
+            }
+        }
+    }
+    // reset stats of the dead ones
+    for (int id = 0; id < MAX_PLAYERS; ++id)
+    {
+        if (dead[id])
+        {
+            int x = -1, y = -1;
+            while (1)
+            {
+                x = rand() % COLUMNS;
+                y = rand() % ROWS;
+                if (FREE_SPACE(board[y][x])) break;
+            }
+            game_data.players[id].coords.x = x;
+            game_data.players[id].coords.y = y;
+
+            game_data.players[id].slowed_down = 0;
+            game_data.players[id].deaths++;
+            game_data.players[id].coins_carried = 0;
+        }
+    }
+
+    // wild beast
+
+    // wrap up the round
+    for (int id = 0; id < MAX_PLAYERS; ++id)
+    {
+        if (game_data.players_shared[id] != NULL)
+        {
+            // update player's shm
+            // (mini)map
+            int x = game_data.players[id].coords.x;
+            int y = game_data.players[id].coords.y;
+            int local_x = (x - 2) < 0 ? 0 : (x - 2);
+            int local_y = (y - 2) < 0 ? 0 : (y - 2);
+            for (int i = local_y; i <= (y + 2) && i < ROWS; ++i)
+            {
+                for (int j = local_x; j <= (x + 2) && j < COLUMNS; ++j)
+                {
+                    game_data.players_shared[id]->player_board[i][j] = board[i][j];
+
+                    // campsite spotted?
+                    if (board[i][j] == 'A')
+                    {
+                        game_data.players[id].campsite.x = j;
+                        game_data.players[id].campsite.y = i;
+                    }
+                }
+            }
+            for (int i = 0; i < SIGHT; ++i)
+            {
+                for (int j = 0; j < SIGHT; ++j)
+                {
+                    if ((y - 2 + i) < 0 || (x - 2 + j) < 0 || (y - 2 + i) >= ROWS || (x - 2 + j) >= COLUMNS) game_data.players_shared[id]->player_minimap[i][j] = ' ';
+                    else game_data.players_shared[id]->player_minimap[i][j] = board[y - 2 + i][x - 2 + j];
+
+                    // enemy players in sight?
+                    for (int id_enemy = 0; id_enemy < MAX_PLAYERS; ++id_enemy)
+                    {
+                        if (game_data.players_shared[id_enemy] != NULL && id_enemy != id)
+                        {
+                            if ((game_data.players[id_enemy].coords.x == (x - 2 + j)) && (game_data.players[id_enemy].coords.y == (y - 2 + i)))
+                            {
+                                game_data.players_shared[id]->player_minimap[i][j] = id_enemy + 1 + '0';
+                            }
+                        }
+                    }
+
+                    // wild beasts in sight?
+                    for (int id_beast = 0; id_beast < MAX_BEASTS; ++id_beast)
+                    {
+                        if (game_data.beasts[id_beast].coords.x >= 0)
+                        {
+                            if ((game_data.beasts[id_beast].coords.x == (x - 2 + j)) && (game_data.beasts[id_beast].coords.y == (y - 2 + i)))
+                            {
+                                game_data.players_shared[id]->player_minimap[i][j] = '*';
+                            }
+                        }
+                    }
+                }
+            }
+            game_data.players_shared[id]->campsite.x = game_data.players[id].campsite.x;
+            game_data.players_shared[id]->campsite.y = game_data.players[id].campsite.y;
+
+            // info
+            game_data.players_shared[id]->coords.x = game_data.players[id].coords.x;
+            game_data.players_shared[id]->coords.y = game_data.players[id].coords.y;
+            game_data.players_shared[id]->round_counter = game_data.players[id].round_counter;
+            game_data.players_shared[id]->direction = game_data.players[id].direction;
+            game_data.players_shared[id]->slowed_down = game_data.players[id].slowed_down;
+            game_data.players_shared[id]->deaths = game_data.players[id].deaths;
+            game_data.players_shared[id]->coins_carried = game_data.players[id].coins_carried;
+            game_data.players_shared[id]->coins_brought = game_data.players[id].coins_brought;
+
+            if (moved[id]) sem_post(&game_data.players_shared[id]->player_continue);
+        }
+    }
+
+    return NULL;
+}
+
+void* beast_action(void* id)
+{
+    int id_beast = *(int *)id;
+    sem_init(&game_data.beasts[id_beast].go, 0, 0);
+    while (1)
+    {
+        int x = game_data.beasts[id_beast].coords.x;
+        int y = game_data.beasts[id_beast].coords.y;
+
+        // any players in sight?
+        for (int i = 0; i < SIGHT; ++i)
+        {
+            for (int j = 0; j < SIGHT; ++j)
+            {
+                // enemy players in sight?
+                for (int id = 0; id < MAX_PLAYERS; ++id)
+                {
+                    if (game_data.players_shared[id] != NULL)
+                    {
+                        // go get 'em!
+                        if ((game_data.players[id].coords.x == (x - 2 + j)) && (game_data.players[id].coords.y == (y - 2 + i)))
+                        {
+                            // depending on player's (x, y) distance, check if you can chase them
+                            // if their x-axis distance < y-axis distance, you try to manipulate y
+                            // - if you can't, you don't see them
+                            // - if you can, you chase them!
+                            // otherwise, you try to manipulate x
+                            // if their x-axis distance == y-axis distance, you try to manipulate x, then y
+
+                            int player_x = game_data.players[id].coords.x;
+                            int player_y = game_data.players[id].coords.y;
+
+                        }
+                    }
+                }
+                // otherwise just.. wander around
+            }
+        }
+        sem_wait(&game_data.beasts[id_beast].go);
     }
 }
