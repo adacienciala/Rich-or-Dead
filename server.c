@@ -5,6 +5,7 @@
 #include <time.h>
 #include <stdlib.h>
 #include <string.h>
+#include <math.h>
 #include <ncurses.h>
 #include <semaphore.h>
 #include <fcntl.h>
@@ -52,7 +53,9 @@ struct beast_t
 {
     pthread_t beast_thread;
     sem_t go;
+    sem_t done;
     struct coords_t coords;
+    enum directions_t direction[2];
 };
 
 struct player_data_t
@@ -120,8 +123,13 @@ void* key_events(void* none);
 void* player_in(void* none);
 void* player_out(void* none);
 void* rounds_up(void* none);
-void* beast_action(void* id);
 int player_pid_shm(char* action, int pid);
+
+//int draw_line_straight(int x0, int y0, int x1, int y1);
+int draw_line_low(int x0, int y0, int x1, int y1);
+int draw_line_high(int x0, int y0, int x1, int y1);
+int draw_line(int x0, int y0, int x1, int y1, int id);
+void* beast_action(void* id);
 
 
 // server's stuff
@@ -129,9 +137,10 @@ sem_t game_end;
 
 // DEVELOPMENT QUESTIONS
 // chyba niepotrzebne mi players_counter tak po prawdzie
-// - bestie, boty + algorytmy do nich (bestia -> post po rundzie)
+// - boty + algorytm do nich
 // - pieprzone mutexy bo dyskoteka od refreshow ;-;
 // - ograniczenie spawnowania -> free_space w strukturze?
+// - pousuwac z playera niepotrzebne includy
 
 int main(void)
 {
@@ -154,6 +163,21 @@ int main(void)
 
     sem_init(&game_end, 0, 0);
     sem_wait(&game_end);
+
+    // kick all the players and clean their stuff up
+    for (int id = 0; id < MAX_PLAYERS; ++id)
+    {
+        if (game_data.players_shared[id] != NULL)
+        {
+            kill(game_data.players[id].PID, 1);
+            sem_destroy(&game_data.players_shared[id]->player_moved);
+            sem_destroy(&game_data.players_shared[id]->player_continue);
+            int pid = game_data.players_shared[id]->PID;
+            munmap(game_data.players_shared[id], sizeof(struct player_data_t));
+            game_data.players_shared[id] = NULL;
+            player_pid_shm("unlink", pid);
+        }
+    }
 
     // clean up lobby's semaphores, lobby's shm and game's semaphore
     sem_destroy(&game_data.lobby->ask);
@@ -404,6 +428,7 @@ void* print_board(void* none)
         mvprintw(++cur_row, cur_col + 7, "- large treasure (50 coins)");
         mvprintw(++cur_row, cur_col + 7, "- campsite");
         mvprintw(++cur_row, cur_col + 7, "- dropped treasure");
+        mvprintw(++cur_row, cur_col + 7, "%d - beasts", game_data.beasts_counter);
 
         refresh();
         game_data.round_counter++;
@@ -430,11 +455,21 @@ void* key_events(void *none)
             // add a new beast
             case 'b':
             case 'B':
-                for (int i = 0; i < MAX_BEASTS; ++i)
+                for (int id_beast = 0; id_beast < MAX_BEASTS; ++id_beast)
                 {
-                    if (game_data.beasts[i].coords.x < 0)
+                    if (game_data.beasts[id_beast].coords.x < 0)
                     {
-                        pthread_create(&game_data.beasts[i].beast_thread, NULL, beast_action, i);
+                        sem_init(&game_data.beasts[id_beast].go, 0, 0);
+                        sem_init(&game_data.beasts[id_beast].done, 0, 0);
+                        while(1)
+                        {
+                            game_data.beasts[id_beast].coords.x = rand() % COLUMNS;
+                            game_data.beasts[id_beast].coords.y = rand() % ROWS;
+                            if (FREE_SPACE(board[game_data.beasts[id_beast].coords.y][game_data.beasts[id_beast].coords.x])) break;
+                        }
+                        game_data.beasts_counter++;
+                        pthread_create(&game_data.beasts[id_beast].beast_thread, NULL, beast_action, &id_beast);
+                        break;
                     }
                 }
                 break;
@@ -613,7 +648,7 @@ void* rounds_up(void* none)
                 // reseting a bit server's struct
                 game_data.players[id].PID = -1;
 
-                // setting up lobby info and allowing the player to leave the lobby and exit
+                // setting up lobby info
                 game_data.lobby->queue[id].want_to = BE_EMPTY;
             }
         }
@@ -692,8 +727,7 @@ void* rounds_up(void* none)
         }
     }
 
-    // another player
-    // looking for collisions
+    // looking for collisions with other players
     int dead[MAX_PLAYERS] = {0};
     for (int id = 0; id < MAX_PLAYERS; ++id)
     {
@@ -710,6 +744,38 @@ void* rounds_up(void* none)
             }
         }
     }
+
+    // looking for collisions with wild beasts
+    for (int id_beast = 0; id_beast < MAX_BEASTS; ++id_beast)
+    {
+        if (game_data.beasts[id_beast].coords.x >= 0)
+        {
+            sem_post(&game_data.beasts[id_beast].go);
+            sem_wait(&game_data.beasts[id_beast].done);
+            for (int id = 0; id < MAX_PLAYERS; ++id)
+            {
+                if (game_data.players_shared[id] != NULL)
+                {
+                    if ((game_data.beasts[id_beast].coords.x == game_data.players[id].coords.x) && (game_data.beasts[id_beast].coords.y == game_data.players[id].coords.y))
+                    {
+                        // kill the player
+                        dead[id] = 1;
+                        board[game_data.players[id].coords.y][game_data.players[id].coords.x] = 'D';
+                        game_data.chests[game_data.players[id].coords.y][game_data.players[id].coords.x] += game_data.players[id].coins_carried;
+
+                        // kill the beast
+                        pthread_cancel(game_data.beasts[id_beast].beast_thread);
+                        game_data.beasts[id_beast].coords.x = -2;
+                        game_data.beasts[id_beast].coords.y = -2;
+                        sem_destroy(&game_data.beasts[id_beast].go);
+                        sem_destroy(&game_data.beasts[id_beast].done);
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
     // reset stats of the dead ones
     for (int id = 0; id < MAX_PLAYERS; ++id)
     {
@@ -730,8 +796,6 @@ void* rounds_up(void* none)
             game_data.players[id].coins_carried = 0;
         }
     }
-
-    // wild beast
 
     // wrap up the round
     for (int id = 0; id < MAX_PLAYERS; ++id)
@@ -804,50 +868,258 @@ void* rounds_up(void* none)
             game_data.players_shared[id]->coins_brought = game_data.players[id].coins_brought;
 
             if (moved[id]) sem_post(&game_data.players_shared[id]->player_continue);
+
         }
     }
 
     return NULL;
 }
 
+int draw_line_low(int x0, int y0, int x1, int y1)
+{
+    int dx = x1 - x0;
+    int dy = y1 - y0;
+    int yi = 1;
+    if (dy < 0)
+    {
+        yi = -1;
+        dy = -1 * dy;
+    }
+    int D = 2*dy - dx;
+    int y = y0;
+
+    for (int x = x0; x < x1; ++x)
+    {
+        if (board[y][x] == '|') return 0;
+        if (D > 0)
+        {
+            y = y + yi;
+            D = D - 2*dx;
+        }
+        D = D + 2*dy;
+    }
+
+    return 1;
+}
+
+int draw_line_high(int x0, int y0, int x1, int y1)
+{
+    int dx = x1 - x0;
+    int dy = y1 - y0;
+    int xi = 1;
+    if (dx < 0)
+    {
+        xi = -1;
+        dx = -1 * dx;
+    }
+    int D = 2*dx - dy;
+    int x = x0;
+
+    for (int y = y0; y < y1; ++y)
+    {
+        if (board[y][x] == '|') return 0;
+        if (D > 0)
+        {
+            x = x + xi;
+            D = D - 2*dy;
+        }
+        D = D + 2*dx;
+    }
+
+    return 1;
+}
+
+//int draw_line_straight(int x0, int y0, int x1, int y1, int id)
+//{
+//    int i = 1;
+//    if (x0 == x1)
+//    {
+//        game_data.beasts[id].direction[1] = STAY;
+//        if (y1 < y0)
+//        {
+//            i = -1;
+//            game_data.beasts[id].direction[0] = NORTH;
+//        }
+//        else
+//        {
+//            game_data.beasts[id].direction[0] = SOUTH;
+//        }
+//        for (int y = y0; y < y1; y += i)
+//        {
+//            if (! FREE_SPACE(board[y][x0])) return 0;
+//        }
+//    }
+//    else
+//    {
+//        game_data.beasts[id].direction[0] = STAY;
+//        if (x1 < x0)
+//        {
+//            i = -1;
+//            game_data.beasts[id].direction[1] = EAST;
+//        }
+//        else
+//        {
+//            game_data.beasts[id].direction[1] = WEST;
+//        }
+//        for (int x = x0; x < x1; x += i)
+//        {
+//            if (! FREE_SPACE(board[y0][x])) return 0;
+//        }
+//    }
+//
+//    return 1;
+//}
+
+int draw_line(int x0, int y0, int x1, int y1, int id)
+{
+    // it's.. complicated.
+    if (y0 > y1) game_data.beasts[id].direction[0] = NORTH;
+    else game_data.beasts[id].direction[0] = SOUTH;
+    if (x0 > x1) game_data.beasts[id].direction[1] = WEST;
+    else game_data.beasts[id].direction[1] = EAST;
+
+    if (x0 == x1) game_data.beasts[id].direction[1] = STAY;
+    if (y0 == y1) game_data.beasts[id].direction[0] = STAY;
+
+    if (abs(y1 - y0) < abs(x1 - x0))
+    {
+        if (x0 > x1)
+        {
+            return draw_line_low(x1, y1, x0, y0);
+        }
+        else
+        {
+            return draw_line_low(x0, y0, x1, y1);
+        }
+    }
+    else
+    {
+        if (y0 > y1)
+        {
+            return draw_line_high(x1, y1, x0, y0);
+        }
+        else
+        {
+            return draw_line_high(x0, y0, x1, y1);
+        }
+    }
+}
+
 void* beast_action(void* id)
 {
     int id_beast = *(int *)id;
-    sem_init(&game_data.beasts[id_beast].go, 0, 0);
+
     while (1)
     {
-        int x = game_data.beasts[id_beast].coords.x;
-        int y = game_data.beasts[id_beast].coords.y;
+        sem_wait(&game_data.beasts[id_beast].go);
+        game_data.beasts[id_beast].direction[0] = STAY;
+        game_data.beasts[id_beast].direction[1] = STAY;
 
-        // any players in sight?
-        for (int i = 0; i < SIGHT; ++i)
+        int beast_x = game_data.beasts[id_beast].coords.x;
+        int beast_y = game_data.beasts[id_beast].coords.y;
+
+        int moved = 0;
+        for (int i = 0; i < SIGHT && moved == 0; ++i)
         {
-            for (int j = 0; j < SIGHT; ++j)
+            for (int j = 0; j < SIGHT && moved == 0; ++j)
             {
-                // enemy players in sight?
+                // enemy players in possible sight?
                 for (int id = 0; id < MAX_PLAYERS; ++id)
                 {
                     if (game_data.players_shared[id] != NULL)
                     {
-                        // go get 'em!
-                        if ((game_data.players[id].coords.x == (x - 2 + j)) && (game_data.players[id].coords.y == (y - 2 + i)))
+                        if ((game_data.players[id].coords.x == (beast_x - 2 + j)) && (game_data.players[id].coords.y == (beast_y - 2 + i)))
                         {
-                            // depending on player's (x, y) distance, check if you can chase them
-                            // if their x-axis distance < y-axis distance, you try to manipulate y
-                            // - if you can't, you don't see them
-                            // - if you can, you chase them!
-                            // otherwise, you try to manipulate x
-                            // if their x-axis distance == y-axis distance, you try to manipulate x, then y
+                            // try to draw a line (using Bresenham's line algorithm)
+                            // returns 1 - you see them, chase them!
+                            // returns 0 - eee what player? no idea what you're talking about
 
                             int player_x = game_data.players[id].coords.x;
                             int player_y = game_data.players[id].coords.y;
 
+                            if (draw_line(beast_x, beast_y, player_x, player_y, id_beast) == 1)
+                            {
+                                // try to go in one of desired directions
+                                switch(game_data.beasts[id_beast].direction[0])
+                                {
+                                    case NORTH:
+                                        if (FREE_SPACE(board[beast_y-1][beast_x]))
+                                        {
+                                            moved = 1;
+                                            beast_y -= 1;
+                                        }
+                                        break;
+                                    case SOUTH:
+                                        if (FREE_SPACE(board[beast_y+1][beast_x]))
+                                        {
+                                            moved = 1;
+                                            beast_y += 1;
+                                        }
+                                        break;
+                                }
+                                if (moved == 0)
+                                {
+                                    switch(game_data.beasts[id_beast].direction[1])
+                                    {
+                                        case WEST:
+                                            if (FREE_SPACE(board[beast_y][beast_x-1]))
+                                            {
+                                                moved = 1;
+                                                beast_x -= 1;
+                                            }
+                                            break;
+                                        case EAST:
+                                            if (FREE_SPACE(board[beast_y][beast_x+1]))
+                                            {
+                                                moved = 1;
+                                                beast_x += 1;
+                                            }
+                                            break;
+                                    }
+                                }
+                            }
                         }
                     }
+                    if (moved == 1) break;
                 }
-                // otherwise just.. wander around
             }
         }
-        sem_wait(&game_data.beasts[id_beast].go);
+        if (moved == 0)
+        {
+            //wander around
+            game_data.beasts[id_beast].direction[0] = rand() % 4 + 1;
+            switch(game_data.beasts[id_beast].direction[0])
+            {
+                case NORTH:
+                    if (board[beast_y-1][beast_x] != '|')
+                    {
+                        beast_y -= 1;
+                    }
+                    break;
+                case SOUTH:
+                    if (board[beast_y+1][beast_x] != '|')
+                    {
+                        beast_y += 1;
+                    }
+                    break;
+                case WEST:
+                    if (board[beast_y][beast_x-1] != '|')
+                    {
+                        beast_x -= 1;
+                    }
+                    break;
+                case EAST:
+                    if (board[beast_y][beast_x+1] != '|')
+                    {
+                        beast_x += 1;
+                    }
+                    break;
+            }
+        }
+
+        game_data.beasts[id_beast].coords.x = beast_x;
+        game_data.beasts[id_beast].coords.y = beast_y;
+
+        sem_post(&game_data.beasts[id_beast].done);
     }
 }
