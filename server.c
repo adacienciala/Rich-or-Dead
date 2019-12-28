@@ -118,7 +118,7 @@ struct game_data_t
 } game_data;
 
 int load_board(char *filename);
-void set_up_game(int PID);
+int set_up_game(int PID);
 void* print_board(void* none);
 void* key_events(void* none);
 void* player_in(void* none);
@@ -148,8 +148,12 @@ int main(void)
     keypad(stdscr, TRUE);
     getmaxyx(stdscr, max_y, max_x);
 
-    load_board("board.txt");
-    set_up_game((int)getpid());
+    if (load_board("board.txt"))
+    {
+        perror("load_board");
+        return 1;
+    }
+    if (set_up_game((int)getpid())) return 1;
 
     pthread_t print_board_thread, player_in_thread, player_out_thread, key_events_thread;
 
@@ -219,15 +223,31 @@ int player_pid_shm(char* action, int pid)
     else return -1;
 }
 
-void set_up_game(int PID)
+int set_up_game(int PID)
 {
     // zero every counter
     game_data.round_counter = 0;
 
     // set the lobby, PID, coords and stuff
     int fd = shm_open("lobby", O_CREAT | O_RDWR, 0600);
-    ftruncate(fd, sizeof(struct lobby_t));
+    if (fd < 0)
+    {
+        perror("shm_open(lobby)");
+        return 1;
+    }
+    if (ftruncate(fd, sizeof(struct lobby_t)) < 0)
+    {
+        shm_unlink("lobby");
+        perror("ftruncate(lobby)");
+        return 1;
+    }
     game_data.lobby = mmap(NULL, sizeof(struct queue_t), PROT_WRITE | PROT_READ, MAP_SHARED, fd, 0);
+    if (*(int *)game_data.lobby == -1)
+    {
+        shm_unlink("lobby");
+        perror("mmap(lobby)");
+        return 1;
+    }
     pthread_mutex_init(&game_data.game_mutex, NULL);
 
     for (int i = 0; i < MAX_PLAYERS; ++i)
@@ -267,6 +287,8 @@ void set_up_game(int PID)
             game_data.chests[i][j] = 0;
         }
     }
+
+    return 0;
 }
 
 int load_board(char *filename)
@@ -318,9 +340,7 @@ void* print_board(void* none)
             for (int j = 0; j < max_x; ++j)
             {
                 // nie potrzebuje tu mutexow - inne watki nie drukuja, a nie korzystam z danych wspoldzielonych.. no nie?
-                // pthread_mutex_lock(&game_data.game_mutex);
                 mvprintw(i, j, " ");
-                // pthread_mutex_unlock(&game_data.game_mutex);
             }
         }
 
@@ -549,9 +569,34 @@ void* player_in(void* none)
             {
                 // making a personalized shared memory with their PID
                 int fd = player_pid_shm("open", game_data.lobby->queue[id].PID);
-                ftruncate(fd, sizeof(struct player_data_t));
+                if (fd < 0)
+                {
+                    kill(game_data.lobby->queue[id].PID, 1);
+                    game_data.lobby->queue[id].want_to = BE_EMPTY;
+                    sem_post(&game_data.lobby->leave);
+                    sem_post(&game_data.lobby->ask);
+                    perror("shm_open(player)");
+                }
+                if (ftruncate(fd, sizeof(struct player_data_t)) < 0)
+                {
+                    kill(game_data.lobby->queue[id].PID, 1);
+                    player_pid_shm("unlink", game_data.lobby->queue[id].PID);
+                    game_data.lobby->queue[id].want_to = BE_EMPTY;
+                    sem_post(&game_data.lobby->leave);
+                    sem_post(&game_data.lobby->ask);
+                    perror("ftruncate(player)");
+                }
                 pthread_mutex_lock(&game_data.game_mutex);
                 game_data.players_shared[id] = mmap(NULL, sizeof(struct player_data_t), PROT_WRITE | PROT_READ, MAP_SHARED, fd, 0);
+                if (*(int *)game_data.lobby == -1)
+                {
+                    kill(game_data.lobby->queue[id].PID, 1);
+                    player_pid_shm("unlink", game_data.lobby->queue[id].PID);
+                    game_data.lobby->queue[id].want_to = BE_EMPTY;
+                    sem_post(&game_data.lobby->leave);
+                    sem_post(&game_data.lobby->ask);
+                    perror("mmap(player)");
+                }
 
                 // setting up server's respecting struct
                 game_data.players[id].ID = id+1;

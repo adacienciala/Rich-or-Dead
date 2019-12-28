@@ -130,10 +130,23 @@ int main(void)
         }
     }
 
-    ftruncate(fd, sizeof(struct lobby_t));
+    if (ftruncate(fd, sizeof(struct lobby_t)) < 0)
+    {
+        perror("ftruncate(lobby)");
+        return 1;
+    }
     game_lobby = mmap(NULL, sizeof(struct lobby_t), PROT_WRITE | PROT_READ, MAP_SHARED, fd, 0);
+    if (*(int *)game_lobby == -1)
+    {
+        perror("mmap(lobby)");
+        return 1;
+    }
 
-    if (join_the_game((int)getpid()) == 0) return 0;
+    if (join_the_game((int)getpid()) == 0)
+    {
+        munmap(game_lobby, sizeof(struct lobby_t));
+        return 1;
+    }
 
     pthread_create(&print_board_thread, NULL, print_board, NULL);
     pthread_create(&key_events_thread, NULL, key_events, NULL);
@@ -377,8 +390,6 @@ int join_the_game(int pid)
         refresh();
         usleep(3000*MS);
 
-        munmap(game_lobby, sizeof(struct lobby_t));
-
         return 0;
     }
 
@@ -413,17 +424,28 @@ int join_the_game(int pid)
             refresh();
             usleep(3000*MS);
 
-            munmap(game_lobby, sizeof(struct lobby_t));
-
             return 0;
         }
     }
 
     // green light, let's get the ball rolling!
     int fd = player_pid_shm("open", pid);
-    ftruncate(fd, sizeof(struct player_data_t));
+    if (fd < 0)
+    {
+        perror("shm_open(player)");
+        return 0;
+    }
+    if (ftruncate(fd, sizeof(struct player_data_t)) < 0)
+    {
+        perror("ftruncate(player)");
+        return 0;
+    }
     player_data = mmap(NULL, sizeof(struct player_data_t), PROT_WRITE | PROT_READ, MAP_SHARED, fd, 0);
-
+    if (*(int *)player_data == -1)
+    {
+        perror("mmap(player)");
+        return 0;
+    }
     return 1;
 }
 
