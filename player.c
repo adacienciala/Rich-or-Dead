@@ -53,6 +53,7 @@ struct player_data_t
     int server_PID;
     enum type_t type;
     struct coords_t coords;
+    struct coords_t spawn_coords;
     struct coords_t campsite;
     int round_counter;
     enum directions_t direction;
@@ -110,13 +111,13 @@ int main(void)
         mvprintw(max_y/2-1, max_x/2-5, "Joining the lobby");
         mvprintw(max_y/2, max_x/2-2, ".");
         refresh();
-        usleep(1000*MS);
+        usleep(250*MS);
         mvprintw(max_y/2, max_x/2-2, "..");
         refresh();
-        usleep(1000*MS);
+        usleep(250*MS);
         mvprintw(max_y/2, max_x/2-2, "...");
         refresh();
-        usleep(1000*MS);
+        usleep(250*MS);
         fd = shm_open("lobby", O_RDWR, 0600);
         if (fd > 0) break;
         if (waiting++ > 20)
@@ -397,13 +398,13 @@ int join_the_game(int pid)
         mvprintw(max_y/2-1, max_x/2-8, "Joining the game");
         mvprintw(max_y/2, max_x/2-2, ".");
         refresh();
-        usleep(1000*MS);
+        usleep(250*MS);
         mvprintw(max_y/2, max_x/2-2, "..");
         refresh();
-        usleep(1000*MS);
+        usleep(250*MS);
         mvprintw(max_y/2, max_x/2-2, "...");
         refresh();
-        usleep(1000*MS);
+        usleep(250*MS);
         if (sem_trywait(&game_lobby->leave) == 0) break;
         if (waiting++ > 20)
         {
@@ -482,13 +483,13 @@ int exit_the_game(int pid)
         mvprintw(max_y/2-1, max_x/2-5, "Exiting the game");
         mvprintw(max_y/2, max_x/2-2, ".");
         refresh();
-        usleep(1000*MS);
+        usleep(250*MS);
         mvprintw(max_y/2, max_x/2-2, "..");
         refresh();
-        usleep(1000*MS);
+        usleep(250*MS);
         mvprintw(max_y/2, max_x/2-2, "...");
         refresh();
-        usleep(1000*MS);
+        usleep(250*MS);
         if (sem_trywait(&game_lobby->leave) == 0) break;
         if (waiting++ > 20)
         {

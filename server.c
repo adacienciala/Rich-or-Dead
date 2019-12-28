@@ -66,6 +66,7 @@ struct player_data_t
     int server_PID;
     enum type_t type;
     struct coords_t coords;
+    struct coords_t spawn_coords;
     struct coords_t campsite;
     int round_counter;
     enum directions_t direction;
@@ -316,9 +317,10 @@ void* print_board(void* none)
         {
             for (int j = 0; j < max_x; ++j)
             {
-                pthread_mutex_lock(&game_data.game_mutex);
+                // nie potrzebuje tu mutexow - inne watki nie drukuja, a nie korzystam z danych wspoldzielonych.. no nie?
+                // pthread_mutex_lock(&game_data.game_mutex);
                 mvprintw(i, j, " ");
-                pthread_mutex_unlock(&game_data.game_mutex);
+                // pthread_mutex_unlock(&game_data.game_mutex);
             }
         }
 
@@ -452,12 +454,13 @@ void* print_board(void* none)
         mvprintw(++cur_row, cur_col + 7, "- large treasure (50 coins)");
         mvprintw(++cur_row, cur_col + 7, "- campsite");
         mvprintw(++cur_row, cur_col + 7, "- dropped treasure");
-
         refresh();
+
         game_data.round_counter++;
         pthread_mutex_unlock(&game_data.game_mutex);
+
         pthread_create(&rounds_up_thread, NULL, rounds_up, NULL);
-        usleep(750 * MS);
+        usleep(125 * MS);
         pthread_join(rounds_up_thread, NULL);
     }
 }
@@ -565,6 +568,8 @@ void* player_in(void* none)
                 }
                 game_data.players[id].coords.x = x;
                 game_data.players[id].coords.y = y;
+                game_data.players[id].spawn_coords.x = x;
+                game_data.players[id].spawn_coords.y = y;
 
                 game_data.players[id].campsite.x = -4;
                 game_data.players[id].campsite.y = -4;
@@ -583,6 +588,8 @@ void* player_in(void* none)
                 game_data.players_shared[id]->type = game_data.players[id].type;
                 game_data.players_shared[id]->coords.x = x;
                 game_data.players_shared[id]->coords.y = y;
+                game_data.players_shared[id]->spawn_coords.x = x;
+                game_data.players_shared[id]->spawn_coords.y = y;
                 game_data.players_shared[id]->round_counter = game_data.players[id].round_counter;
                 game_data.players_shared[id]->direction = STAY;
                 game_data.players_shared[id]->slowed_down = 0;
@@ -835,14 +842,8 @@ void* rounds_up(void* none)
         {
             int x = -1, y = -1;
             pthread_mutex_lock(&game_data.game_mutex);
-            while (1)
-            {
-                x = rand() % COLUMNS;
-                y = rand() % ROWS;
-                if (FREE_SPACE(board[y][x])) break;
-            }
-            game_data.players[id].coords.x = x;
-            game_data.players[id].coords.y = y;
+            game_data.players[id].coords.x = game_data.players[id].spawn_coords.x;
+            game_data.players[id].coords.y = game_data.players[id].spawn_coords.y;
 
             game_data.players[id].slowed_down = 0;
             game_data.players[id].deaths++;

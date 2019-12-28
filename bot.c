@@ -54,6 +54,7 @@ struct player_data_t
     int server_PID;
     enum type_t type;
     struct coords_t coords;
+    struct coords_t spawn_coords;
     struct coords_t campsite;
     int round_counter;
     enum directions_t direction;
@@ -151,7 +152,7 @@ void* move_bot(void *none)
     while(1)
     {
         // if you see a beast, GET OUT
-        // (well it's not working it's best :/)
+        // (well it's not working its best :/)
         int seen = 0;
         a = STAY;
         for (int i = 0; i < SIGHT && seen == 0; ++i)
