@@ -159,10 +159,10 @@ int main(void)
 void* key_events(void *none)
 {
     // constantly listening to the keyboard
-    char a;
+    int a;
     while(1)
     {
-        a = getchar();
+        a = getch();
         switch(a)
         {
             // quit the game
@@ -171,22 +171,22 @@ void* key_events(void *none)
                 exit_the_game(player_data->PID);
                 return NULL;
             // set your desired action
-            //case KEY_UP:
+            case KEY_UP:
             case 'w':
             case 'W':
                 player_data->direction = NORTH;
                 break;
-            //case KEY_RIGHT:
+            case KEY_RIGHT:
             case 'd':
             case 'D':
                 player_data->direction = EAST;
                 break;
-            //case KEY_DOWN:
+            case KEY_DOWN:
             case 's':
             case 'S':
                 player_data->direction = SOUTH;
                 break;
-            //case KEY_LEFT:
+            case KEY_LEFT:
             case 'a':
             case 'A':
                 player_data->direction = WEST;

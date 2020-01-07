@@ -329,7 +329,7 @@ void* print_board(void* none)
 
     while(1)
     {
-        clear();
+//        clear();
         pthread_mutex_lock(&game_data.game_mutex);
         board[game_data.campsite.y][game_data.campsite.x] = 'A';
         pthread_mutex_unlock(&game_data.game_mutex);
