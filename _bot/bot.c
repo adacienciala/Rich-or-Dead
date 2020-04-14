@@ -1,168 +1,105 @@
-#define _GNU_SOURCE //pthread_tryjoin_np
+#define _GNU_SOURCE // pthread_tryjoin_np
 #include <stdio.h>
-#include <unistd.h>
-#include <pthread.h>
-#include <time.h>
-#include <stdlib.h>
+#include <unistd.h> // pid, usleep
+#include <stdlib.h> // srand
 #include <string.h>
+#include <math.h>
+#include <sys/mman.h> // shm
+#include <fcntl.h> // O_ constants
 #include <ncurses.h>
+#include <pthread.h>
 #include <semaphore.h>
-#include <fcntl.h>
-#include <sys/mman.h>
-#include <sys/types.h>
 
-#define MS 1000
-
-// colors stuff
-#define C_PLAYER 1
-#define C_WALL 2
-#define C_BEAST 3
-#define C_MONEY 4
-#define C_CAMPSITE 5
-#define C_DROPPED 6
-#define C_DEFAULT 7
-#define C_TERMINAL 8
-
+#include "bot.h"
 
 // board stuff
-#define ROWS 25
-#define COLUMNS 51
-#define FREE_SPACE(a) ( a == ' ' || a == '.' )
-
+char board[ROWS][COLUMNS];
+int free_spots;
 int max_x, max_y;
 
+// bot stuff
+pthread_t print_board_thread, key_events_thread, move_bot_thread;
 
-// game stuff
-#define MAX_PLAYERS 4
-#define SIGHT 5
-
-enum type_t { HUMAN, CPU };
-enum directions_t { STAY, NORTH, EAST, SOUTH, WEST };
-enum state_t { BE_EMPTY, CONTINUE, JOIN, EXIT };
-
-struct coords_t
+void* move_bot(void *none)
 {
-    int x;
-    int y;
-};
-
-struct player_data_t
-{
-    int ID;
-    int PID;
-    int server_PID;
-    enum type_t type;
-    struct coords_t coords;
-    struct coords_t spawn_coords;
-    struct coords_t campsite;
-    int round_counter;
-    enum directions_t direction;
-    int slowed_down;
-    int deaths;
-    int coins_carried;
-    int coins_brought;
-    char player_minimap[SIGHT][SIGHT];
-    char player_board[ROWS][COLUMNS];
-    sem_t player_moved;
-    sem_t player_continue;
-} * player_data;
-
-struct queue_t
-{
-    enum state_t want_to;
-    enum type_t type;
-    int PID;
-};
-
-struct lobby_t
-{
-    struct queue_t queue[MAX_PLAYERS];
-
-    sem_t ask;
-    sem_t leave;
-
-    sem_t joined;
-    sem_t exited;
-} * game_lobby;
-
-void* key_events(void *none);
-void* print_board(void* none);
-int join_the_game(int pid);
-int exit_the_game(int pid);
-int player_pid_shm(char* action, int pid);
-
-// player stuff
-pthread_t print_board_thread, key_events_thread;
-
-int main(void)
-{
-    srand(time(NULL));
-    initscr();
-    noecho();
-    curs_set(FALSE);
-    keypad(stdscr, TRUE);
-    getmaxyx(stdscr, max_y, max_x);
-
-    // trying to join the lobby, if the server is up and running
-    int waiting = 0, fd = 0;
+    enum directions_t a;
     while(1)
     {
-        clear();
-        mvprintw(max_y/2-1, max_x/2-5, "Joining the lobby");
-        mvprintw(max_y/2, max_x/2-2, ".");
-        refresh();
-        usleep(250*MS);
-        mvprintw(max_y/2, max_x/2-2, "..");
-        refresh();
-        usleep(250*MS);
-        mvprintw(max_y/2, max_x/2-2, "...");
-        refresh();
-        usleep(250*MS);
-        fd = shm_open("lobby", O_RDWR, 0600);
-        if (fd > 0) break;
-        if (waiting++ > 20)
+        // if you see a beast, GET OUT
+        // (well it's not working its best :/)
+        int seen = 0;
+        a = STAY;
+        for (int i = 0; i < SIGHT && seen == 0; ++i)
         {
-            clear();
-            mvprintw(max_y/2-1, max_x/2-5, "Couldn't join the lobby");
-            refresh();
-            usleep(3000*MS);
-            return 1;
+            for (int j = 0; j < SIGHT && seen == 0; ++j)
+            {
+                if (player_data->player_minimap[i][j] == '*')
+                {
+                    seen = 1;
+                    int beast_x = j, beast_y = i;
+                    int bot_x = player_data->coords.x, bot_y = player_data->coords.y;
+
+                    // what possible actions you can take?
+                    int possible_action[4] = {0}; // (N, E, S, W)
+                    if ((i - 1) >= 0 && player_data->player_minimap[i-1][j] != '|') 
+                        possible_action[0] = 1;
+                    if ((j + 1) < COLUMNS && player_data->player_minimap[i][j+1] != '|') 
+                        possible_action[1] = 1;
+                    if ((i + 1) < ROWS && player_data->player_minimap[i+1][j] != '|') 
+                        possible_action[2] = 1;
+                    if ((j - 1) >= 0 && player_data->player_minimap[i][j-1] != '|')
+                        possible_action[3] = 1;
+
+                    float max = -666;
+                    for (int i = 0; i < 4; ++i)
+                    {
+                        if (possible_action[i])
+                        {
+                            int new_x = bot_x, new_y = bot_y;
+                            switch(i)
+                            {
+                                case 0:
+                                    new_y -= 1;
+                                    break;
+                                case 1:
+                                    new_x += 1;
+                                    break;
+                                case 2:
+                                    new_y += 1;
+                                    break;
+                                case 3:
+                                    new_x -= 1;
+                            }
+
+                            // calculate and choose the safest distance
+                            float temp = sqrt(pow(new_x - beast_x, 2) + pow(new_y - beast_y, 2));
+                            if (temp > max || max == -666)
+                            {
+                                max = temp;
+                                a = i + 1;
+                            }
+                        }
+                    }
+                    break;
+                }
+            }
         }
+        if (seen == 0) a = rand() % 4 + 1;
+
+        player_data->direction = a;
+
+        sem_post(&player_data->player_moved);
+        sem_wait(&player_data->player_continue);
     }
-
-    if (ftruncate(fd, sizeof(struct lobby_t)) < 0)
-    {
-        perror("ftruncate(lobby)");
-        return 1;
-    }
-    game_lobby = mmap(NULL, sizeof(struct lobby_t), PROT_WRITE | PROT_READ, MAP_SHARED, fd, 0);
-    if (*(int *)game_lobby == -1)
-    {
-        perror("mmap(lobby)");
-        return 1;
-    }
-
-    if (join_the_game((int)getpid()) == 0)
-    {
-        munmap(game_lobby, sizeof(struct lobby_t));
-        return 1;
-    }
-
-    pthread_create(&print_board_thread, NULL, print_board, NULL);
-    pthread_create(&key_events_thread, NULL, key_events, NULL);
-
-    pthread_join(key_events_thread, NULL);
-
-    return 0;
 }
 
 void* key_events(void *none)
 {
     // constantly listening to the keyboard
-    int a;
+    char a;
     while(1)
     {
-        a = getch();
+        a = getchar();
         switch(a)
         {
             // quit the game
@@ -170,29 +107,7 @@ void* key_events(void *none)
             case 'Q':
                 exit_the_game(player_data->PID);
                 return NULL;
-            // set your desired action
-            case KEY_UP:
-            case 'w':
-            case 'W':
-                player_data->direction = NORTH;
-                break;
-            case KEY_RIGHT:
-            case 'd':
-            case 'D':
-                player_data->direction = EAST;
-                break;
-            case KEY_DOWN:
-            case 's':
-            case 'S':
-                player_data->direction = SOUTH;
-                break;
-            case KEY_LEFT:
-            case 'a':
-            case 'A':
-                player_data->direction = WEST;
         }
-        sem_post(&player_data->player_moved);
-        sem_wait(&player_data->player_continue);
     }
 }
 
@@ -212,7 +127,6 @@ void* print_board(void* none)
     init_pair(C_DROPPED, COLOR_GREEN, COLOR_YELLOW);
     init_pair(C_DEFAULT, COLOR_BLACK, COLOR_WHITE);
     init_pair(C_TERMINAL, COLOR_WHITE, COLOR_BLACK);
-    // dodac moze dodatkowe kolory dla minimapy? w sensie tlo ciemniejsze a bit
 
     // terminal background
     attron(COLOR_PAIR(C_DEFAULT));
@@ -292,8 +206,10 @@ void* print_board(void* none)
                     default:
                         attron(COLOR_PAIR(C_PLAYER));
                 }
-                if ((y - 2 + i) < 0 || (x - 2 + j) < 0 || (y - 2 + i) >= ROWS || (x - 2 + j) >= COLUMNS) continue;
-                else mvprintw(y-2+i, x-2+j, "%c", player_data->player_minimap[i][j]);
+                if ((y - 2 + i) < 0 || (x - 2 + j) < 0 || (y - 2 + i) >= ROWS || (x - 2 + j) >= COLUMNS) 
+                    continue;
+                else 
+                    mvprintw(y-2+i, x-2+j, "%c", player_data->player_minimap[i][j]);
                 if (i == 2 && j == 2)
                 {
                     attron(COLOR_PAIR(C_PLAYER));
@@ -306,8 +222,10 @@ void* print_board(void* none)
         int cur_row = 0, cur_col = COLUMNS + 4;
         attron(COLOR_PAIR(C_DEFAULT));
         mvprintw(++cur_row, cur_col, "Server's PID: %d", player_data->server_PID);
-        if (player_data->campsite.x >= 0) mvprintw(++cur_row, cur_col + 1, "Campsite X/Y: %02d/%02d  ", player_data->campsite.x, player_data->campsite.y);
-        else mvprintw(++cur_row, cur_col + 1, "Campsite X/Y: unknown");
+        if (player_data->campsite.x >= 0) 
+            mvprintw(++cur_row, cur_col + 1, "Campsite X/Y: %02d/%02d  ", player_data->campsite.x, player_data->campsite.y);
+        else 
+            mvprintw(++cur_row, cur_col + 1, "Campsite X/Y: unknown");
         mvprintw(++cur_row, cur_col + 1, "Round number: %d", player_data->round_counter);
 
         // players info
@@ -316,7 +234,7 @@ void* print_board(void* none)
         mvprintw(++cur_row, cur_col + 1, "Number");
         mvprintw(cur_row, cur_col + 13, "%d", player_data->ID);
         mvprintw(++cur_row, cur_col + 1, "Type");
-        mvprintw(cur_row, cur_col + 13, "%s", "HUMAN");
+        mvprintw(cur_row, cur_col + 13, "%s", "CPU");
         mvprintw(++cur_row, cur_col + 1, "Curr X/Y");
         mvprintw(cur_row, cur_col + 13, "%02d/%02d", player_data->coords.x, player_data->coords.y);
         mvprintw(++cur_row, cur_col + 1, "Deaths");
@@ -328,7 +246,7 @@ void* print_board(void* none)
         mvprintw(cur_row, cur_col + 13, "%d    ", player_data->coins_brought);
 
         // legend
-        cur_row += 5;
+        cur_row += 2;
         mvprintw(++cur_row, cur_col, "Legend:");
         attron(COLOR_PAIR(C_PLAYER));
         mvprintw(++cur_row, cur_col + 1, "1234");
@@ -395,7 +313,7 @@ int join_the_game(int pid)
 
     // make yourself comfortable
     game_lobby->queue[free_spot].want_to = JOIN;
-    game_lobby->queue[free_spot].type = HUMAN;
+    game_lobby->queue[free_spot].type = CPU;
     game_lobby->queue[free_spot].PID = pid;
 
     // let them know you're waiting
@@ -416,7 +334,8 @@ int join_the_game(int pid)
         mvprintw(max_y/2, max_x/2-2, "...");
         refresh();
         usleep(250*MS);
-        if (sem_trywait(&game_lobby->leave) == 0) break;
+        if (sem_trywait(&game_lobby->leave) == 0) 
+            break;
         if (waiting++ > 20)
         {
             clear();
@@ -446,6 +365,7 @@ int join_the_game(int pid)
         perror("mmap(player)");
         return 0;
     }
+
     return 1;
 }
 
@@ -465,6 +385,7 @@ int exit_the_game(int pid)
     // wait for you turn to ask the server to exit
     sem_wait(&game_lobby->ask);
     pthread_cancel(print_board_thread);
+    pthread_cancel(move_bot_thread);
     clear();
 
     // find your spot in the lobby
@@ -512,7 +433,8 @@ int exit_the_game(int pid)
         mvprintw(max_y/2, max_x/2-2, "...");
         refresh();
         usleep(250*MS);
-        if (sem_trywait(&game_lobby->leave) == 0) break;
+        if (sem_trywait(&game_lobby->leave) == 0) 
+            break;
         if (waiting++ > 20)
         {
             clear();
